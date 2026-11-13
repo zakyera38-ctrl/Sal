@@ -1,0 +1,417 @@
+name: Build Glass Zalith APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream tag/branch (bos birak: 1.4.1.2 etiketi aranir, yoksa main)"
+        required: false
+        default: ""
+  push:
+    paths:
+      - ".github/workflows/build-apk.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
+    steps:
+      - name: Upstream surumunu sec
+        id: ref
+        env:
+          INPUT_REF: ${{ github.event.inputs.ref }}
+        run: |
+          REF="$INPUT_REF"
+          if [ -z "$REF" ]; then
+            TAGS=$(git ls-remote --tags --refs https://github.com/ZalithLauncher/ZalithLauncher.git | awk '{print $2}' | sed 's#refs/tags/##')
+            REF=$(echo "$TAGS" | grep -E '(^|[^0-9])1\.4\.1\.2([^0-9]|$)' | head -n1 || true)
+            [ -z "$REF" ] && REF=main
+          fi
+          echo "Kullanilan surum: $REF"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Kaynak kodu indir
+        uses: actions/checkout@v4
+        with:
+          repository: ZalithLauncher/ZalithLauncher
+          ref: ${{ steps.ref.outputs.ref }}
+          path: upstream
+          submodules: recursive
+          fetch-depth: 1
+          lfs: true
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Gradle onbellek
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Mod kaynaklarini yaz (cam butonlar + optimizasyon paneli)
+        run: |
+          mkdir -p mod_src
+
+          cat > mod_src/ModInit.java <<'JAVA'
+          package mod.ui;
+
+          import android.app.Activity;
+          import android.app.Application;
+          import android.content.ContentProvider;
+          import android.content.ContentValues;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Bundle;
+
+          /** Uygulama acilirken otomatik calisir; her ekrana cam efektini uygular. */
+          public class ModInit extends ContentProvider {
+              @Override
+              public boolean onCreate() {
+                  try {
+                      Application app = (Application) getContext().getApplicationContext();
+                      app.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
+                          @Override public void onActivityResumed(Activity a) { try { Glass.attach(a); } catch (Throwable ignored) {} }
+                          @Override public void onActivityCreated(Activity a, Bundle b) {}
+                          @Override public void onActivityStarted(Activity a) {}
+                          @Override public void onActivityPaused(Activity a) {}
+                          @Override public void onActivityStopped(Activity a) {}
+                          @Override public void onActivitySaveInstanceState(Activity a, Bundle b) {}
+                          @Override public void onActivityDestroyed(Activity a) {}
+                      });
+                  } catch (Throwable ignored) {}
+                  return true;
+              }
+              @Override public Cursor query(Uri u, String[] p, String s, String[] a, String o) { return null; }
+              @Override public String getType(Uri u) { return null; }
+              @Override public Uri insert(Uri u, ContentValues v) { return null; }
+              @Override public int delete(Uri u, String s, String[] a) { return 0; }
+              @Override public int update(Uri u, ContentValues v, String s, String[] a) { return 0; }
+          }
+          JAVA
+
+          cat > mod_src/Glass.java <<'JAVA'
+          package mod.ui;
+
+          import android.animation.Animator;
+          import android.animation.ObjectAnimator;
+          import android.animation.PropertyValuesHolder;
+          import android.animation.StateListAnimator;
+          import android.app.Activity;
+          import android.content.Context;
+          import android.content.res.ColorStateList;
+          import android.graphics.Color;
+          import android.graphics.drawable.GradientDrawable;
+          import android.graphics.drawable.RippleDrawable;
+          import android.os.Build;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.ViewTreeObserver;
+          import android.view.animation.OvershootInterpolator;
+          import android.widget.Button;
+          import android.widget.FrameLayout;
+          import android.widget.TextView;
+          import java.util.WeakHashMap;
+
+          /** Beyaz cam (glass) golgeli, animasyonlu buton stili. */
+          public final class Glass {
+              private static final WeakHashMap<View, Boolean> DONE = new WeakHashMap<>();
+              private static final WeakHashMap<Activity, Boolean> WATCHED = new WeakHashMap<>();
+              private static final WeakHashMap<Activity, View> FABS = new WeakHashMap<>();
+
+              private Glass() {}
+
+              static int dp(Context c, float v) {
+                  return Math.round(v * c.getResources().getDisplayMetrics().density);
+              }
+
+              static boolean isGame(Activity a) {
+                  String n = a.getClass().getName();
+                  return n.equals("net.kdt.pojavlaunch.MainActivity") || n.endsWith("GameActivity");
+              }
+
+              public static void attach(final Activity a) {
+                  if (isGame(a)) return;
+                  final View decor = a.getWindow().getDecorView();
+                  scan(decor);
+                  if (WATCHED.put(a, true) == null) {
+                      final boolean[] pending = {false};
+                      decor.getViewTreeObserver().addOnGlobalLayoutListener(new ViewTreeObserver.OnGlobalLayoutListener() {
+                          @Override public void onGlobalLayout() {
+                              if (pending[0]) return;
+                              pending[0] = true;
+                              decor.postDelayed(new Runnable() {
+                                  @Override public void run() { pending[0] = false; scan(decor); }
+                              }, 120);
+                          }
+                      });
+                  }
+                  addFab(a);
+              }
+
+              static void scan(View v) {
+                  if (v instanceof Button && DONE.put(v, true) == null) style(v);
+                  if (v instanceof ViewGroup) {
+                      ViewGroup g = (ViewGroup) v;
+                      for (int i = 0; i < g.getChildCount(); i++) scan(g.getChildAt(i));
+                  }
+              }
+
+              static Animator scaleAnim(View v, float s, long ms) {
+                  ObjectAnimator o = ObjectAnimator.ofPropertyValuesHolder(v,
+                          PropertyValuesHolder.ofFloat(View.SCALE_X, s),
+                          PropertyValuesHolder.ofFloat(View.SCALE_Y, s));
+                  o.setDuration(ms);
+                  return o;
+              }
+
+              static void press(View v) {
+                  StateListAnimator sla = new StateListAnimator();
+                  sla.addState(new int[]{android.R.attr.state_pressed}, scaleAnim(v, 0.93f, 90));
+                  sla.addState(new int[]{}, scaleAnim(v, 1f, 170));
+                  v.setStateListAnimator(sla);
+              }
+
+              static void glow(View v, float d) {
+                  v.setElevation(5 * d);
+                  if (Build.VERSION.SDK_INT >= 28) {
+                      v.setOutlineAmbientShadowColor(Color.WHITE);
+                      v.setOutlineSpotShadowColor(Color.WHITE);
+                  }
+              }
+
+              /** Bir Button'a cam gorunumu + basma animasyonu verir. */
+              public static void style(View b) {
+                  try {
+                      float d = b.getContext().getResources().getDisplayMetrics().density;
+                      GradientDrawable fill = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                              new int[]{0x5CFFFFFF, 0x22FFFFFF});
+                      fill.setCornerRadius(14 * d);
+                      fill.setStroke(Math.max(1, Math.round(d)), 0xA0FFFFFF);
+                      GradientDrawable mask = new GradientDrawable();
+                      mask.setColor(Color.WHITE);
+                      mask.setCornerRadius(14 * d);
+                      b.setBackground(new RippleDrawable(ColorStateList.valueOf(0x80FFFFFF), fill, mask));
+                      glow(b, d);
+                      press(b);
+                      if (b.getAlpha() == 1f && b.isShown()) {
+                          b.setScaleX(0.9f);
+                          b.setScaleY(0.9f);
+                          b.animate().scaleX(1f).scaleY(1f).setDuration(280)
+                                  .setInterpolator(new OvershootInterpolator()).start();
+                      }
+                  } catch (Throwable ignored) {}
+              }
+
+              static void addFab(final Activity a) {
+                  ViewGroup content = a.findViewById(android.R.id.content);
+                  if (content == null) return;
+                  View old = FABS.get(a);
+                  if (old != null && old.getParent() == content) { old.bringToFront(); return; }
+
+                  final TextView t = new TextView(a);
+                  t.setText("\u26A1");
+                  t.setTextSize(20);
+                  t.setTextColor(Color.WHITE);
+                  t.setGravity(Gravity.CENTER);
+                  t.setClickable(true);
+                  float d = a.getResources().getDisplayMetrics().density;
+                  GradientDrawable g = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                          new int[]{0x70FFFFFF, 0x28FFFFFF});
+                  g.setShape(GradientDrawable.OVAL);
+                  g.setStroke(Math.max(1, Math.round(d)), 0xB0FFFFFF);
+                  GradientDrawable mask = new GradientDrawable();
+                  mask.setShape(GradientDrawable.OVAL);
+                  mask.setColor(Color.WHITE);
+                  t.setBackground(new RippleDrawable(ColorStateList.valueOf(0x80FFFFFF), g, mask));
+                  glow(t, d);
+                  t.setElevation(10 * d);
+                  press(t);
+                  t.setOnClickListener(v -> Optimizer.show(a));
+
+                  final ObjectAnimator pulse = ObjectAnimator.ofFloat(t, View.ALPHA, 0.65f, 1f);
+                  pulse.setDuration(1400);
+                  pulse.setRepeatCount(ObjectAnimator.INFINITE);
+                  pulse.setRepeatMode(ObjectAnimator.REVERSE);
+                  t.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+                      @Override public void onViewAttachedToWindow(View v) { pulse.start(); }
+                      @Override public void onViewDetachedFromWindow(View v) { pulse.cancel(); }
+                  });
+
+                  int s = dp(a, 46);
+                  FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(s, s, Gravity.BOTTOM | Gravity.END);
+                  lp.setMargins(0, 0, dp(a, 14), dp(a, 14));
+                  content.addView(t, lp);
+                  FABS.put(a, t);
+              }
+          }
+          JAVA
+
+          cat > mod_src/Optimizer.java <<'JAVA'
+          package mod.ui;
+
+          import android.app.Activity;
+          import android.app.ActivityManager;
+          import android.app.Dialog;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.graphics.drawable.ColorDrawable;
+          import android.graphics.drawable.GradientDrawable;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.Window;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.SeekBar;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.util.Locale;
+
+          /** RAM / JVM / bellek temizleme paneli + dil secimi (TR, EN, DE, ES). */
+          public final class Optimizer {
+              private static final String[] CODES = {"tr", "en", "de", "es"};
+              // 0 baslik, 1 ram bilgisi, 2 ayrilan ram, 3 onerilen, 4 uygula, 5 kaydedildi,
+              // 6 jvm, 7 dengeli, 8 performans, 9 sifirla, 10 temizle, 11 temizlendi, 12 kapat, 13 uyari, 14 dil
+              private static final String[][] L = {
+                  {"\u26A1 Optimizasyon", "Toplam RAM: %d MB  \u2022  Bo\u015F: %d MB", "Oyuna ayr\u0131lacak RAM: %d MB",
+                   "\u00D6nerilen", "Uygula", "Kaydedildi. Oyunu yeniden ba\u015Flat\u0131n.", "JVM \u00F6n ayar\u0131",
+                   "Dengeli", "Performans", "S\u0131f\u0131rla", "Belle\u011Fi temizle", "Temizlendi. Bo\u015F RAM: %d MB",
+                   "Kapat", "Oyun a\u00E7\u0131lmazsa \u2018S\u0131f\u0131rla\u2019ya bas\u0131n.", "Dil"},
+                  {"\u26A1 Optimization", "Total RAM: %d MB  \u2022  Free: %d MB", "RAM for game: %d MB",
+                   "Recommended", "Apply", "Saved. Restart the game.", "JVM preset",
+                   "Balanced", "Performance", "Reset", "Free memory", "Cleaned. Free RAM: %d MB",
+                   "Close", "If the game won't start, press Reset.", "Language"},
+                  {"\u26A1 Optimierung", "Gesamt-RAM: %d MB  \u2022  Frei: %d MB", "RAM f\u00FCr das Spiel: %d MB",
+                   "Empfohlen", "Anwenden", "Gespeichert. Spiel neu starten.", "JVM-Voreinstellung",
+                   "Ausgewogen", "Leistung", "Zur\u00FCcksetzen", "Speicher freigeben", "Bereinigt. Freier RAM: %d MB",
+                   "Schlie\u00DFen", "Startet das Spiel nicht, Zur\u00FCcksetzen dr\u00FCcken.", "Sprache"},
+                  {"\u26A1 Optimizaci\u00F3n", "RAM total: %d MB  \u2022  Libre: %d MB", "RAM para el juego: %d MB",
+                   "Recomendado", "Aplicar", "Guardado. Reinicia el juego.", "Ajuste JVM",
+                   "Equilibrado", "Rendimiento", "Restablecer", "Liberar memoria", "Limpiado. RAM libre: %d MB",
+                   "Cerrar", "Si el juego no inicia, pulsa Restablecer.", "Idioma"}
+              };
+              private static final String PRESET_BAL = "-XX:+DisableExplicitGC";
+              private static final String PRESET_PERF = "-XX:+DisableExplicitGC -XX:MaxGCPauseMillis=50";
+
+              private Optimizer() {}
+
+              static SharedPreferences own(Context c) { return c.getSharedPreferences("mod_ui_prefs", Context.MODE_PRIVATE); }
+              static SharedPreferences game(Context c) { return c.getSharedPreferences(c.getPackageName() + "_preferences", Context.MODE_PRIVATE); }
+
+              static int langIndex(Context c) {
+                  String code = own(c).getString("lang", Locale.getDefault().getLanguage());
+                  for (int i = 0; i < CODES.length; i++) if (CODES[i].equals(code)) return i;
+                  return 1;
+              }
+
+              static long[] mem(Context c) {
+                  ActivityManager am = (ActivityManager) c.getSystemService(Context.ACTIVITY_SERVICE);
+                  ActivityManager.MemoryInfo mi = new ActivityManager.MemoryInfo();
+                  am.getMemoryInfo(mi);
+                  return new long[]{mi.totalMem >> 20, mi.availMem >> 20};
+              }
+
+              static int recommended(long totalMb) {
+                  if (totalMb <= 3072) return 1024;
+                  if (totalMb <= 4096) return 1536;
+                  if (totalMb <= 6144) return 2048;
+                  if (totalMb <= 8192) return 3072;
+                  return 4096;
+              }
+
+              static int readAlloc(SharedPreferences p, int def) {
+                  Object o = p.getAll().get("allocation");
+                  try {
+                      if (o instanceof Integer) return (Integer) o;
+                      if (o instanceof Long) return ((Long) o).intValue();
+                      if (o instanceof String) return Integer.parseInt((String) o);
+                  } catch (Exception ignored) {}
+                  return def;
+              }
+
+              static void writeAlloc(SharedPreferences p, int mb) {
+                  Object o = p.getAll().get("allocation");
+                  SharedPreferences.Editor e = p.edit();
+                  if (o instanceof String) e.putString("allocation", String.valueOf(mb));
+                  else if (o instanceof Long) e.putLong("allocation", mb);
+                  else e.putInt("allocation", mb);
+                  e.apply();
+              }
+
+              static boolean setArgs(Context c, String preset) {
+                  SharedPreferences gp = game(c), op = own(c);
+                  Object cur = gp.getAll().get("javaArgs");
+                  if (cur != null && !(cur instanceof String)) return false;
+                  if (preset == null) {
+                      gp.edit().putString("javaArgs", op.getString("args_backup", "")).apply();
+                      op.edit().remove("args_backup").apply();
+                  } else {
+                      if (!op.contains("args_backup")) op.edit().putString("args_backup", cur == null ? "" : (String) cur).apply();
+                      gp.edit().putString("javaArgs", preset).apply();
+                  }
+                  return true;
+              }
+
+              static TextView text(Context c, String s, int sp, boolean bold) {
+                  TextView t = new TextView(c);
+                  t.setText(s);
+                  t.setTextSize(sp);
+                  t.setTextColor(Color.WHITE);
+                  if (bold) t.setTypeface(t.getTypeface(), android.graphics.Typeface.BOLD);
+                  t.setPadding(0, Glass.dp(c, 8), 0, Glass.dp(c, 4));
+                  return t;
+              }
+
+              static Button btn(Context c, String s, View.OnClickListener l) {
+                  Button b = new Button(c);
+                  b.setText(s);
+                  b.setTextColor(Color.WHITE);
+                  b.setAllCaps(false);
+                  b.setTextSize(13);
+                  b.setMinHeight(0);
+                  b.setMinimumHeight(0);
+                  b.setMinWidth(0);
+                  b.setMinimumWidth(0);
+                  b.setPadding(Glass.dp(c, 8), Glass.dp(c, 10), Glass.dp(c, 8), Glass.dp(c, 10));
+                  Glass.style(b);
+                  b.setOnClickListener(l);
+                  return b;
+              }
+
+              static LinearLayout row(Context c, View... items) {
+                  LinearLayout r = new LinearLayout(c);
+                  r.setOrientation(LinearLayout.HORIZONTAL);
+                  int m = Glass.dp(c, 4);
+                  for (View v : items) {
+                      LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+                      lp.setMargins(m, m, m, m);
+                      r.addView(v, lp);
+                  }
+                  return r;
+              }
+
+              static void toast(Context c, String s) { Toast.makeText(c, s, Toast.LENGTH_SHORT).show(); }
+
+              public static void show(final Activity a) {
+                  final String[] s = L[langIndex(a)];
+                  final long[] m = mem(a);
+                  final int step = 128, min = 512;
+                  final int max = (int) Math.max(1024, (m[0] * 80 / 100) / step * step);
+                  final SharedPreferences gp = game(a);
+                  final int cur = Math.max(min, Math.min(max, readAlloc(gp, recommended(m[0]))));
+
+                  final Dialog d = new Dialog(a);
+                  d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+                  ScrollView sv = new ScrollVi
